@@ -1,68 +1,34 @@
 #!/usr/bin/env python
-import sys
-import warnings
+import os
+from software_engineering.crew import EngineeringTeam
 
-from datetime import datetime
 
-from software_engineering.crew import SoftwareEngineering
-
-warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
-
-# This main file is intended to be a way for you to run your
-# crew locally, so refrain from adding unnecessary logic into this file.
-# Replace with inputs you want to test with, it will automatically
-# interpolate any tasks and agents information
+# Requirements for the project
+requirements = """
+A trading simulation platform account system.
+- Create accounts, deposit, withdraw.
+- Record buy/sell shares with quantity.
+- Portfolio valuation and P/L calculation.
+- Holdings and transaction history.
+- Prevent invalid operations.
+- Use get_share_price(symbol) with test prices for AAPL, TSLA, GOOGL.
+- Provide a simple frontend to demonstrate functionality.
+"""
 
 def run():
-    """
-    Run the crew.
-    """
-    inputs = {
-        'topic': 'AI LLMs',
-        'current_year': str(datetime.now().year)
-    }
-    
-    try:
-        SoftwareEngineering().crew().kickoff(inputs=inputs)
-    except Exception as e:
-        raise Exception(f"An error occurred while running the crew: {e}")
+    os.makedirs('output', exist_ok=True)
 
+    inputs = {"requirements": requirements}
 
-def train():
-    """
-    Train the crew for a given number of iterations.
-    """
-    inputs = {
-        "topic": "AI LLMs",
-        'current_year': str(datetime.now().year)
-    }
-    try:
-        SoftwareEngineering().crew().train(n_iterations=int(sys.argv[1]), filename=sys.argv[2], inputs=inputs)
+    team = EngineeringTeam()
 
-    except Exception as e:
-        raise Exception(f"An error occurred while training the crew: {e}")
+    # Run the design step
+    design_result = team.crew().kickoff(inputs=inputs)
+    with open("output/project_plan.json") as f:
+        design_output = f.read()
 
-def replay():
-    """
-    Replay the crew execution from a specific task.
-    """
-    try:
-        SoftwareEngineering().crew().replay(task_id=sys.argv[1])
-
-    except Exception as e:
-        raise Exception(f"An error occurred while replaying the crew: {e}")
-
-def test():
-    """
-    Test the crew execution and returns the results.
-    """
-    inputs = {
-        "topic": "AI LLMs",
-        "current_year": str(datetime.now().year)
-    }
-    
-    try:
-        SoftwareEngineering().crew().test(n_iterations=int(sys.argv[1]), eval_llm=sys.argv[2], inputs=inputs)
-
-    except Exception as e:
-        raise Exception(f"An error occurred while testing the crew: {e}")
+    # Build and run dynamic tasks (backend, tests, frontend)
+    dynamic_tasks = team.build_dynamic_tasks(design_output)
+    dynamic_crew = team.crew()
+    dynamic_crew.tasks.extend(dynamic_tasks)
+    dynamic_crew.kickoff(inputs=inputs)
