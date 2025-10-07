@@ -1,6 +1,6 @@
 design_task:
   description: >
-    Generate a JSON project plan (modules/classes) from the requirements.
+    Analyze the project requirements and output a structured JSON project plan.
   expected_output: >
     Valid JSON following ProjectSpec schema.
   agent: engineering_lead

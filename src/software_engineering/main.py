@@ -16,19 +16,28 @@ A trading simulation platform account system.
 """
 
 def run():
-    os.makedirs('output', exist_ok=True)
+    # Ensure output structure
+    os.makedirs('output/backend', exist_ok=True)
+    os.makedirs('output/tests', exist_ok=True)
+
+    # Create only the top-level __init__.py
+    init_file = os.path.join('output', '__init__.py')
+    if not os.path.exists(init_file):
+        with open(init_file, 'w', encoding='utf-8') as f:
+            f.write('# Package initializer\n')    
 
     inputs = {"requirements": requirements}
 
     team = EngineeringTeam()
+    crew = team.crew()
 
-    # Run the design step
-    design_result = team.crew().kickoff(inputs=inputs)
-    with open("output/project_plan.json") as f:
-        design_output = f.read()
+    print("\n🚀 Starting the EngineeringTeam crew...")
+    print("📋 Running design phase (callback will handle dynamic tasks)...\n")
 
-    # Build and run dynamic tasks (backend, tests, frontend)
-    dynamic_tasks = team.build_dynamic_tasks(design_output)
-    dynamic_crew = team.crew()
-    dynamic_crew.tasks.extend(dynamic_tasks)
-    dynamic_crew.kickoff(inputs=inputs)
+    try:
+        # The callback in crew.py will handle the next steps dynamically
+        crew.kickoff(inputs=inputs)
+        print("\n✅ Design phase complete — dynamic tasks will now execute automatically.\n")
+
+    except Exception as e:
+        print(f"\n❌ An error occurred while running the crew: {e}\n")

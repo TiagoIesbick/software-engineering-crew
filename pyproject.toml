@@ -8,6 +8,7 @@ dependencies = [
     "crewai[tools]>=0.201.1,<1.0.0",
     "gradio>=5.49.0",
     "pydantic>=2.11.9",
+    "pytest>=8.4.2",
 ]
 
 [project.scripts]
@@ -23,3 +24,7 @@ build-backend = "hatchling.build"
 
 [tool.crewai]
 type = "crew"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["output/tests"]
