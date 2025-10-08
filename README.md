@@ -1,6 +1,6 @@
-# SoftwareEngineering Crew
+# Software Engineering Crew
 
-Welcome to the SoftwareEngineering Crew project, powered by [crewAI](https://crewai.com). This project demonstrates how to use CrewAI to create a complete software engineering team that can design, implement, test, and build a frontend for complex software projects.
+Welcome to the Software Engineering Crew project, powered by [crewAI](https://crewai.com). This project demonstrates how to use CrewAI to create a complete software engineering team capable of designing, implementing, and testing the backend, as well as building the frontend for complex software projects.
 
 ## 🚀 What This Project Does
 
@@ -51,7 +51,7 @@ pip install uv
 
 Install the dependencies:
 ```bash
-crewai install
+uv sync
 ```
 
 **Important**: Add your `OPENAI_API_KEY` to a `.env` file in the project root.

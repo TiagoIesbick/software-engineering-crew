@@ -207,12 +207,12 @@ class PortfolioService:
             holdings = pf.holdings
             pos = holdings.get(sym, Position(symbol=sym, quantity=Decimal(0), total_cost=Decimal(0)))
 
-            total = (qty * px).quantize(self._cash_q, rounding=self._rounding)
-            realized = Decimal(0).quantize(self._cash_q, rounding=self._rounding)
+            total = (qty * px)
+            realized = Decimal(0)
 
             if norm_side == "buy":
-                new_qty = (pos.quantity + qty).quantize(self._qty_q, rounding=self._rounding)
-                new_total_cost = (pos.total_cost + total).quantize(self._cash_q, rounding=self._rounding)
+                new_qty = pos.quantity + qty
+                new_total_cost = pos.total_cost + total
                 pos.quantity = new_qty
                 pos.total_cost = new_total_cost
                 holdings[sym] = pos
@@ -250,10 +250,10 @@ class PortfolioService:
                 portfolio_id=portfolio_id,
                 side=norm_side,
                 symbol=sym,
-                quantity=qty,
-                price=px,
-                total=total,
-                position_after=pos_after,
+                quantity=qty.quantize(self._qty_q),
+                price=px.quantize(self._cash_q),
+                total=(qty * px).quantize(self._cash_q, rounding=self._rounding),
+                position_after=pos_after.quantize(self._qty_q),
                 avg_cost_after=avg_after,
                 realized_pnl=realized,
                 memo=memo,

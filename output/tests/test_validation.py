@@ -125,9 +125,9 @@ def test_total_cash_computation_and_rounding():
     total2 = rules.total_cash(1, 2.345)
     assert total2 == Decimal("2.34")
 
-    # Float inputs handled via str conversion: 0.25 * 0.1 -> 0.03
+    # Float inputs handled via str conversion: 0.25 * 0.1 -> 0.02
     total3 = rules.total_cash(0.25, 0.1)
-    assert total3 == Decimal("0.03")
+    assert total3 == Decimal("0.02")
 
 
 def test_invalid_numeric_inputs_raise_InvalidValueError():
@@ -162,4 +162,4 @@ def test_constructor_decimal_places_validation_and_zero_places_behavior():
 def test_rules_dataclass_is_immutable():
     rules = ValidationRules()
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(rules, "cash_decimal_places", 4)
+        rules.cash_decimal_places = 4

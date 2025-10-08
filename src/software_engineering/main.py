@@ -25,7 +25,7 @@ def run():
     init_file = os.path.join('output', '__init__.py')
     if not os.path.exists(init_file):
         with open(init_file, 'w', encoding='utf-8') as f:
-            f.write('# Package initializer\n')    
+            f.write('# Package initializer\n')
 
     inputs = {"requirements": requirements}
 

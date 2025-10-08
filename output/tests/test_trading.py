@@ -251,7 +251,7 @@ def test_trade_record_immutable():
     rec = eng.place_order(aid, "buy", "ABC", 1, 1)
     assert isinstance(rec, TradeRecord)
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(rec, "side", "hacked")
+        rec.side = "hacked"
 
 
 def test_global_trades_order_and_timezone():

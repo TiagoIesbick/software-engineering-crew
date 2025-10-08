@@ -217,7 +217,7 @@ def test_transaction_entry_immutable():
     rec = ledger.record_deposit("A", 1)
     assert isinstance(rec, TransactionEntry)
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(rec, "type", "hacked")
+        rec.type = "hacked"
 
 
 def test_concurrent_records_thread_safety():
@@ -260,7 +260,7 @@ def test_float_handling_in_inputs():
     rec = ledger.record_buy("A", "XYZ", 0.25, 0.1)
     assert rec.quantity == Decimal("0.25000000")
     assert rec.price == Decimal("0.10")
-    assert rec.amount == Decimal("0.03")  # 0.25 * 0.10 -> 0.025 -> 0.03 with cash quantization
+    assert rec.amount == Decimal("0.02")  # 0.25 * 0.10 -> 0.025 -> 0.02 (banker's rounding)
 
 
 def test_balance_and_position_after_quantization():

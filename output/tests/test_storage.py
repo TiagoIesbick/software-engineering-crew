@@ -289,7 +289,7 @@ def test_transaction_immutable_and_timezone_and_ordering():
 
     # Immutability
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(t1, "type", "hacked")
+        t1.type = "hacked"
 
     # Global order and timezone awareness
     glob = store.get_transactions()

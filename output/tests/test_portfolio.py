@@ -252,16 +252,16 @@ def test_immutable_dataclasses():
     rec = svc.record_trade(pid, "buy", "ABC", 1, 1)
     assert isinstance(rec, TradeRecord)
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(rec, "side", "hacked")
+        rec.side = "hacked"
 
     # PositionValuation and PortfolioValuation immutability via valuation
     val = svc.value(pid, {"ABC": 2})
     assert isinstance(val, PortfolioValuation)
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(val, "total_market_value", Decimal("999"))
+        val.total_market_value = Decimal("999")
     assert len(val.positions) == 1
     with pytest.raises(FrozenInstanceError):
-        object.__setattr__(val.positions[0], "price", Decimal("0"))
+        val.positions[0].price = Decimal("0")
 
 
 def test_global_trades_order_and_timezone():
