@@ -54,7 +54,9 @@ Install the dependencies:
 uv sync
 ```
 
-**Important**: Add your `OPENAI_API_KEY` to a `.env` file in the project root.
+**Important**:
+- Add your `OPENAI_API_KEY` to a `.env` file in the project root.
+- `Docker engine` MUST be running.
 
 ## 🏃‍♂️ Running the Project
 

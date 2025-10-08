@@ -46,7 +46,7 @@ class EngineeringTeam():
             max_execution_time=500,
             max_retry_limit=3
         )
-        
+
     def handle_design_output(self, output: TaskOutput):
         """Executed automatically after design_task completes."""
         print("\n✅ [Callback] Design task completed. Parsing plan and building tasks...\n")
@@ -90,7 +90,7 @@ class EngineeringTeam():
     def build_dynamic_tasks(self, design_output: str):
         """Build tasks dynamically based on engineering lead's plan."""
         spec = ProjectSpec(**json.loads(design_output))
-        
+
         print(f"Spec: {spec}")
         print(f"Design output: {design_output}")
         print(f"Spec data: {json.loads(design_output)}")
@@ -101,7 +101,7 @@ class EngineeringTeam():
             print(f"Class name: {module.class_name}")
             print(f"Module name: {module.name}")
             print(f"Purpose: {module.purpose}")
-            
+
             # Backend task
             tasks.append(Task(
                 description=f"Implement module {module.name} with class {module.class_name}. Purpose: {module.purpose}",

@@ -22,7 +22,7 @@ engineering_lead:
     - Limit the design to a **maximum of 8 backend modules** that fully cover the requirements.
     - Focus on logical backend components only.
     - Ensure the design is modular and maintainable.
-    
+
     Requirements: {requirements}
   backstory: >
     You're a seasoned engineering lead who defines compact, clear backend architectures
