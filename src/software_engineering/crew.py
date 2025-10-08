@@ -25,7 +25,7 @@ class EngineeringTeam():
             verbose=True,
             allow_code_execution=True,
             code_execution_mode="safe",
-            max_execution_time=500,
+            max_execution_time=1000,
             max_retry_limit=3
         )
 
@@ -82,6 +82,8 @@ class EngineeringTeam():
         """Initial design task (triggers dynamic build on completion)."""
         return Task(
             config=self.tasks_config['design_task'],
+            agent=self.engineering_lead(),
+            output_file="output/project_plan.json",
             callback=self.handle_design_output
         )
 

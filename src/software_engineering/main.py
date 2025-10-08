@@ -12,7 +12,8 @@ A trading simulation platform account system.
 - Holdings and transaction history.
 - Prevent invalid operations.
 - Use get_share_price(symbol) with test prices for AAPL, TSLA, GOOGL.
-- Provide a simple frontend to demonstrate functionality.
+
+Note: Frontend/UI will be handled separately by the frontend engineer.
 """
 
 def run():

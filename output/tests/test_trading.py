@@ -1,215 +1,335 @@
-from decimal import Decimal
+import threading
+from dataclasses import FrozenInstanceError
+from decimal import Decimal, ROUND_HALF_EVEN
+from datetime import timezone
+
 import pytest
 
-from output.backend.trading import TradingEngine, TradingError
-from output.backend.account_service import AccountService
-from output.backend.portfolio_repository import PortfolioRepository
-from output.backend.transaction_repository import TransactionRepository
-from output.backend.pricing import PriceService
-from output.backend.validators import InsufficientFundsError, InsufficientHoldingsError
-from output.backend.portfolio import Portfolio
+from output.backend.trading import (
+    TradingEngine,
+    AccountNotFoundError,
+    AccountAlreadyExistsError,
+    InvalidOrderError,
+    InsufficientCashError,
+    InsufficientHoldingsError,
+    TradeRecord,
+)
 
 
-def test_buy_with_market_price_successful():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
+def test_create_account_default():
+    eng = TradingEngine()
+    aid = eng.create_account()
+    assert isinstance(aid, str)
+    assert len(aid) == 32  # uuid4 hex
+    assert aid in eng.list_accounts()
 
-    # create account and portfolio
-    acct_svc.create_account(owner='alice', initial_deposit='1000.00', account_id='acct-1')
-    p = Portfolio(portfolio_id='p1', owner='alice', account_id='acct-1')
-    port_repo.save(p)
+    cash = eng.get_cash_balance(aid)
+    assert isinstance(cash, Decimal)
+    assert cash == Decimal("0.00")
 
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo, price_service=PriceService())
+    # No trades are created on account creation
+    assert eng.get_trades(aid) == []
 
-    tx = engine.buy(account_id='acct-1', portfolio_id='p1', symbol='AAPL', quantity='2', use_market_price=True)
-
-    # AAPL price is 150.00, amount should be 300.00
-    assert tx.amount == Decimal('300.00')
-
-    # Account balance decreased
-    acct = acct_svc.get_account('acct-1')
-    assert acct.get_balance() == Decimal('700.00')
-
-    # Holding created and quantity updated
-    holding = port_repo.get('p1').get_holding('AAPL')
-    assert holding is not None
-    assert holding.quantity == Decimal('2').quantize(Decimal('0.00000001'))
-
-    # Transaction persisted in transaction repository
-    assert tx_repo.get(tx.transaction_id) is not None
+    # Positions are empty and position for an unknown symbol is zero
+    assert eng.get_positions(aid) == {}
+    assert eng.get_position(aid, "XYZ") == Decimal("0")
 
 
-def test_buy_insufficient_funds_raises_and_no_side_effects():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
+def test_create_account_with_initial_cash_various_types_and_rounding():
+    eng = TradingEngine(cash_decimal_places=2, rounding=ROUND_HALF_EVEN)
 
-    acct_svc.create_account(owner='bob', initial_deposit='10.00', account_id='acct-2')
-    p = Portfolio(portfolio_id='p2', owner='bob', account_id='acct-2')
-    port_repo.save(p)
+    # int
+    a1 = eng.create_account(account_id="A1", initial_cash=10)
+    assert eng.get_cash_balance(a1) == Decimal("10.00")
 
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo)
+    # float (via str conversion) -> 0.1 becomes 0.10
+    a2 = eng.create_account(account_id="A2", initial_cash=0.1)
+    assert eng.get_cash_balance(a2) == Decimal("0.10")
 
-    with pytest.raises(InsufficientFundsError):
-        engine.buy(account_id='acct-2', portfolio_id='p2', symbol='AAPL', quantity='1', use_market_price=True)
+    # str
+    a3 = eng.create_account(account_id="A3", initial_cash="20.2")
+    assert eng.get_cash_balance(a3) == Decimal("20.20")
 
-    # Ensure account balance unchanged and no holding created
-    acct = acct_svc.get_account('acct-2')
-    assert acct.get_balance() == Decimal('10.00')
-    assert port_repo.get('p2').get_holding('AAPL') is None
+    # Decimal with HALF_EVEN: 10.235 -> 10.24
+    a4 = eng.create_account(account_id="A4", initial_cash=Decimal("10.235"))
+    assert eng.get_cash_balance(a4) == Decimal("10.24")
 
-
-def test_buy_portfolio_not_found_rolls_back_account():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
-
-    acct_svc.create_account(owner='carol', initial_deposit='500.00', account_id='acct-3')
-
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo)
-
-    # portfolio 'missing-p' does not exist; buy should attempt withdraw then refund
-    with pytest.raises(TradingError):
-        engine.buy(account_id='acct-3', portfolio_id='missing-p', symbol='AAPL', quantity='1', use_market_price=True)
-
-    # balance should have been refunded to original
-    acct = acct_svc.get_account('acct-3')
-    assert acct.get_balance() == Decimal('500.00')
+    # No trades logged for creation
+    assert eng.get_trades("A4") == []
 
 
-def test_buy_transaction_persist_failure_rolls_back_portfolio_and_account():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-
-    class FailingTransactionRepo:
-        def __init__(self):
-            self._store = {}
-
-        def save(self, transaction):
-            raise RuntimeError('simulated persist failure')
-
-        def get(self, tid):
-            return self._store.get(tid)
-
-        def delete(self, tid):
-            if tid in self._store:
-                del self._store[tid]
-            else:
-                raise KeyError(tid)
-
-        def list_all(self):
-            return list(self._store.values())
-
-        def exists(self, tid):
-            return tid in self._store
-
-        def list_for_account(self, account_id):
-            return [t for t in self._store.values() if getattr(t, 'account_id', None) == account_id or (isinstance(t, dict) and t.get('account_id') == account_id)]
-
-    failing_tx_repo = FailingTransactionRepo()
-
-    # create account and portfolio
-    acct_svc.create_account(owner='dave', initial_deposit='1000.00', account_id='acct-4')
-    p = Portfolio(portfolio_id='p4', owner='dave', account_id='acct-4')
-    port_repo.save(p)
-
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=failing_tx_repo)
-
-    with pytest.raises(TradingError):
-        engine.buy(account_id='acct-4', portfolio_id='p4', symbol='AAPL', quantity='1', use_market_price=True)
-
-    # Ensure account balance was restored and portfolio has no holding (rollback succeeded)
-    acct = acct_svc.get_account('acct-4')
-    assert acct.get_balance() == Decimal('1000.00')
-    assert port_repo.get('p4').get_holding('AAPL') is None
+def test_create_account_duplicate_id():
+    eng = TradingEngine()
+    aid = "dup123"
+    eng.create_account(account_id=aid, initial_cash=5)
+    with pytest.raises(AccountAlreadyExistsError):
+        eng.create_account(account_id=aid, initial_cash=0)
 
 
-def test_sell_successful_deposits_and_records_transaction():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
-
-    # Create account with small starting balance
-    acct_svc.create_account(owner='erin', initial_deposit='0.00', account_id='acct-5')
-
-    # Create portfolio and add a holding
-    p = Portfolio(portfolio_id='p5', owner='erin', account_id='acct-5')
-    # set a holding directly via buy to ensure correct normalization
-    p.buy('AAPL', quantity='5', price='100.00')
-    port_repo.save(p)
-
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo)
-
-    tx = engine.sell(account_id='acct-5', portfolio_id='p5', symbol='AAPL', quantity='2', price='150.00', use_market_price=False)
-
-    # Amount = 2 * 150 = 300.00 deposited to account
-    acct = acct_svc.get_account('acct-5')
-    assert acct.get_balance() == Decimal('300.00')
-
-    # Holding quantity reduced to 3
-    holding = port_repo.get('p5').get_holding('AAPL')
-    assert holding is not None
-    assert holding.quantity == Decimal('3').quantize(Decimal('0.00000001'))
-
-    # Transaction persisted
-    assert tx_repo.get(tx.transaction_id) is not None
+def test_create_account_invalid_initial_cash():
+    eng = TradingEngine()
+    with pytest.raises(InvalidOrderError):
+        eng.create_account(account_id="neg", initial_cash=-1)
+    with pytest.raises(InvalidOrderError):
+        eng.create_account(account_id="badstr", initial_cash="not-a-number")
 
 
-def test_sell_insufficient_holdings_raises_and_no_side_effects():
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
+def test_buy_and_sell_normal_flow_and_trades():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=100)
 
-    acct_svc.create_account(owner='frank', initial_deposit='0.00', account_id='acct-6')
-    p = Portfolio(portfolio_id='p6', owner='frank', account_id='acct-6')
-    p.buy('TSLA', quantity='1', price='100.00')
-    port_repo.save(p)
+    # BUY 0.5 @ 100 -> total 50.00
+    rec1 = eng.place_order(aid, "BUY", "BTC", Decimal("0.5"), 100, memo="first buy")
+    assert isinstance(rec1, TradeRecord)
+    assert rec1.side == "buy"  # normalized
+    assert rec1.symbol == "BTC"
+    assert rec1.quantity == Decimal("0.50000000")  # default qty dp = 8
+    assert rec1.price == Decimal("100.00")
+    assert rec1.total == Decimal("50.00")
+    assert rec1.cash_balance_after == Decimal("50.00")
+    assert rec1.position_after == Decimal("0.50000000")
+    assert rec1.memo == "first buy"
+    assert rec1.timestamp.tzinfo == timezone.utc
 
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo)
+    assert eng.get_cash_balance(aid) == Decimal("50.00")
+    assert eng.get_position(aid, "BTC") == Decimal("0.50000000")
 
+    # SELL 0.1 @ 150 -> total 15.00
+    rec2 = eng.place_order(aid, "sell", "BTC", "0.1", "150", memo="partial sell")
+    assert rec2.side == "sell"
+    assert rec2.total == Decimal("15.00")
+    assert rec2.cash_balance_after == Decimal("65.00")
+    assert rec2.position_after == Decimal("0.40000000")
+    assert rec2.memo == "partial sell"
+
+    assert eng.get_cash_balance(aid) == Decimal("65.00")
+    positions = eng.get_positions(aid)
+    assert positions == {"BTC": Decimal("0.40000000")}
+
+    # Trades per account
+    trades = eng.get_trades(aid)
+    assert [t.side for t in trades] == ["buy", "sell"]
+    assert all(isinstance(t, TradeRecord) for t in trades)
+
+
+def test_place_order_invalid_params_and_missing_account():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=10)
+
+    # Invalid side
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "hold", "ABC", 1, 1)
+
+    # Invalid symbol
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "", 1, 1)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "   ", 1, 1)
+
+    # Invalid quantity
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", 0, 1)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", -1, 1)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", "n/a", 1)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", {"bad": "type"}, 1)
+
+    # Invalid price
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", 1, 0)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", 1, -1)
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", 1, "bad")
+    with pytest.raises(InvalidOrderError):
+        eng.place_order(aid, "buy", "ABC", 1, {"bad": "type"})
+
+    # Missing account
+    with pytest.raises(AccountNotFoundError):
+        eng.place_order("missing", "buy", "ABC", 1, 1)
+
+
+def test_buy_insufficient_cash_error():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=1)
+
+    with pytest.raises(InsufficientCashError):
+        eng.place_order(aid, "buy", "ABC", 2, 1)  # total 2 > cash 1
+
+    assert eng.get_cash_balance(aid) == Decimal("1.00")
+    assert eng.get_trades(aid) == []
+
+
+def test_sell_insufficient_holdings_error():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=10)
+
+    # No holdings -> cannot sell
     with pytest.raises(InsufficientHoldingsError):
-        engine.sell(account_id='acct-6', portfolio_id='p6', symbol='TSLA', quantity='2', price='200.00', use_market_price=False)
+        eng.place_order(aid, "sell", "ABC", 1, 1)
 
-    # ensure nothing changed
-    assert acct_svc.get_account('acct-6').get_balance() == Decimal('0.00')
-    assert port_repo.get('p6').get_holding('TSLA').quantity == Decimal('1').quantize(Decimal('0.00000001'))
+    # Buy some, then attempt to sell more than available
+    eng.place_order(aid, "buy", "ABC", 1, 1)
+    with pytest.raises(InsufficientHoldingsError):
+        eng.place_order(aid, "sell", "ABC", 2, 1)
 
-
-def test_resolve_price_failure_raises_trading_error_for_market_price():
-    # Using a symbol not supported by PriceService should raise TradingError when use_market_price=True
-    acct_svc = AccountService()
-    port_repo = PortfolioRepository()
-    tx_repo = TransactionRepository()
-
-    acct_svc.create_account(owner='gary', initial_deposit='100.00', account_id='acct-7')
-    p = Portfolio(portfolio_id='p7', owner='gary', account_id='acct-7')
-    port_repo.save(p)
-
-    engine = TradingEngine(account_service=acct_svc, portfolio_repo=port_repo, transaction_repo=tx_repo, price_service=PriceService())
-
-    with pytest.raises(TradingError):
-        engine.buy(account_id='acct-7', portfolio_id='p7', symbol='UNKNOWN', quantity='1', use_market_price=True)
+    # State unchanged after failed sell
+    assert eng.get_position(aid, "ABC") == Decimal("1.00000000")
 
 
-def test_get_portfolio_holdings_portfolio_not_found_raises():
-    engine = TradingEngine()
-    with pytest.raises(TradingError):
-        engine.get_portfolio_holdings('no-such')
+def test_quantization_and_rounding_behavior():
+    eng = TradingEngine(cash_decimal_places=2, qty_decimal_places=8, rounding=ROUND_HALF_EVEN)
+    aid = eng.create_account(initial_cash=10)
+
+    # qty will be quantized to 8 dp: 0.123456789 -> 0.12345679
+    # price will be quantized to 2 dp with HALF_EVEN: 1.005 -> 1.00
+    rec = eng.place_order(aid, "buy", "XYZ", Decimal("0.123456789"), Decimal("1.005"))
+
+    assert rec.quantity == Decimal("0.12345679")
+    assert rec.price == Decimal("1.00")
+    assert rec.total == Decimal("0.12")  # 0.12345679 * 1.00 -> 0.12 after cash quantization
+    assert eng.get_cash_balance(aid) == Decimal("9.88")
+    assert eng.get_position(aid, "XYZ") == Decimal("0.12345679")
 
 
-def test_list_transactions_for_account_forwards_to_repo():
-    tx_repo = TransactionRepository()
+def test_get_trades_returns_copies_and_account_specific():
+    eng = TradingEngine()
+    a1 = eng.create_account(initial_cash=10)
+    a2 = eng.create_account(initial_cash=10)
 
-    # Create a couple of transactions directly via repo save
-    # Use dict transactions so repository assigns ids
-    t1 = {'account_id': 'acct-X', 'amount': 10}
-    t2 = {'account_id': 'acct-X', 'amount': 20}
-    tid1 = tx_repo.save(t1)
-    tid2 = tx_repo.save(t2)
+    eng.place_order(a1, "buy", "AAA", 1, 1)
+    eng.place_order(a2, "buy", "BBB", 2, 1)
+    eng.place_order(a2, "sell", "BBB", 1, 2)
 
-    engine = TradingEngine(transaction_repo=tx_repo)
-    found = engine.list_transactions_for_account('acct-X')
-    # ensure both returned
-    ids = { (tx.get('transaction_id') if isinstance(tx, dict) else getattr(tx, 'transaction_id')) for tx in found }
-    assert {tid1, tid2} <= ids
+    global_trades = eng.get_trades()
+    per1 = eng.get_trades(a1)
+    per2 = eng.get_trades(a2)
+
+    gl_len = len(global_trades)
+    p1_len = len(per1)
+    p2_len = len(per2)
+
+    # Tamper with returned lists; internal state should remain unchanged
+    global_trades.append("tamper")
+    per1.append("tamper")
+    per2.append("tamper")
+
+    assert len(eng.get_trades()) == gl_len
+    assert len(eng.get_trades(a1)) == p1_len
+    assert len(eng.get_trades(a2)) == p2_len
+
+    # Account-specific retrieval for missing account should raise
+    with pytest.raises(AccountNotFoundError):
+        eng.get_trades("missing")
+
+
+def test_list_accounts_contains_all_created():
+    eng = TradingEngine()
+    ids = {eng.create_account(), eng.create_account(), eng.create_account()}
+    listed = set(eng.list_accounts())
+    assert ids.issubset(listed)
+    assert len(listed) == len(ids)
+
+
+def test_constructor_decimal_places_validation():
+    with pytest.raises(ValueError):
+        TradingEngine(cash_decimal_places=-1)
+    with pytest.raises(ValueError):
+        TradingEngine(qty_decimal_places=-1)
+
+    # Zero decimal places works for cash
+    eng = TradingEngine(cash_decimal_places=0)
+    aid = eng.create_account(initial_cash=1.2)
+    assert eng.get_cash_balance(aid) == Decimal("1")  # quantized to 0 dp
+
+
+def test_trade_record_immutable():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=10)
+    rec = eng.place_order(aid, "buy", "ABC", 1, 1)
+    assert isinstance(rec, TradeRecord)
+    with pytest.raises(FrozenInstanceError):
+        object.__setattr__(rec, "side", "hacked")
+
+
+def test_global_trades_order_and_timezone():
+    eng = TradingEngine()
+    a1 = eng.create_account(initial_cash=10)
+    a2 = eng.create_account(initial_cash=10)
+
+    eng.place_order(a1, "buy", "AAA", 1, 1)
+    eng.place_order(a2, "buy", "BBB", 2, 1)
+    eng.place_order(a2, "sell", "BBB", 1, 2)
+
+    trades = eng.get_trades()
+    sides = [t.side for t in trades]
+    assert sides == ["buy", "buy", "sell"]
+
+    timestamps = [t.timestamp for t in trades]
+    assert all(ts.tzinfo == timezone.utc for ts in timestamps)
+    assert timestamps == sorted(timestamps)
+
+
+def test_concurrent_buys_thread_safety():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=100)
+
+    symbol = "XYZ"
+    qty = Decimal("0.01")
+    price = Decimal("1.00")
+    orders_per_thread = 50
+    thread_count = 5
+
+    def worker():
+        for _ in range(orders_per_thread):
+            eng.place_order(aid, "buy", symbol, qty, price)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    expected_total_cost = (qty * price * orders_per_thread * thread_count).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    expected_cash = Decimal("100.00") - expected_total_cost
+    expected_pos = (qty * orders_per_thread * thread_count).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)
+
+    assert eng.get_cash_balance(aid) == expected_cash
+    assert eng.get_position(aid, symbol) == expected_pos
+
+    # Trades should all be buys for that account
+    per_trades = eng.get_trades(aid)
+    assert len(per_trades) == orders_per_thread * thread_count
+    assert all(t.side == "buy" and t.symbol == symbol for t in per_trades)
+
+
+def test_positions_copy_and_zero_removal():
+    eng = TradingEngine()
+    aid = eng.create_account(initial_cash=10)
+
+    # Buy 1 @ 1, then sell 1 @ 2 -> position goes to zero and removed
+    eng.place_order(aid, "buy", "ABC", 1, 1)
+    assert eng.get_positions(aid) == {"ABC": Decimal("1.00000000")}
+
+    eng.place_order(aid, "sell", "ABC", 1, 2)
+    assert eng.get_position(aid, "ABC") == Decimal("0")
+    assert "ABC" not in eng.get_positions(aid)
+
+    # Returned positions dict is a copy
+    pos_copy = eng.get_positions(aid)
+    pos_copy["FAKE"] = Decimal("1.0")
+    assert "FAKE" not in eng.get_positions(aid)
+
+
+def test_getters_missing_account():
+    eng = TradingEngine()
+    with pytest.raises(AccountNotFoundError):
+        eng.get_cash_balance("missing")
+    with pytest.raises(AccountNotFoundError):
+        eng.get_positions("missing")
+    with pytest.raises(AccountNotFoundError):
+        eng.get_position("missing", "ABC")
+    with pytest.raises(AccountNotFoundError):
+        eng.get_trades("missing")

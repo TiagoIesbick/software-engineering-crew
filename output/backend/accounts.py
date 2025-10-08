@@ -1,146 +1,266 @@
-"""accounts.py
-
-Provides the Account class representing a user account with a cash balance.
-Supports creating accounts, depositing, and withdrawing while enforcing basic
-invariants (non-negative balances, positive amounts for operations, and
-insufficient funds checks).
-
-This module is self-contained and uses only the Python standard library.
-"""
-
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, getcontext
-from threading import Lock
-from typing import Optional, Dict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
+from typing import Dict, List, Optional, Union
+import threading
 import uuid
-
-# Set a reasonable default precision for monetary operations
-getcontext().prec = 28
-
-# A helper constant for two decimal places (cents)
-_CENT = Decimal('0.01')
 
 
 class AccountError(Exception):
     """Base class for account-related errors."""
 
 
-class InvalidAmountError(AccountError):
-    """Raised when an invalid amount (e.g., negative or zero) is provided."""
+class AccountNotFoundError(AccountError):
+    """Raised when an account does not exist."""
+
+
+class AccountAlreadyExistsError(AccountError):
+    """Raised when an account already exists."""
 
 
 class InsufficientFundsError(AccountError):
-    """Raised when a withdrawal would overdraw the account."""
+    """Raised when a withdrawal exceeds the available balance."""
 
 
-def _to_decimal(amount) -> Decimal:
-    """Convert an input amount to Decimal rounded to 2 decimal places.
-
-    Accepts Decimal, int, float, or str. Raises InvalidAmountError for
-    unconvertible values.
-    """
-    try:
-        dec = Decimal(amount)
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise InvalidAmountError(f"Invalid monetary amount: {amount!r}") from exc
-
-    # Quantize to cents using a sensible rounding mode
-    return dec.quantize(_CENT, rounding=ROUND_HALF_UP)
+class InvalidAmountError(AccountError):
+    """Raised when an amount is invalid (non-numeric, negative, or zero where not allowed)."""
 
 
 @dataclass
 class Account:
-    """Represents a user account with a cash balance.
+    """Represents an account with a balance and creation timestamp."""
 
-    Attributes:
-        account_id: Unique identifier for the account. If not provided, a
-            UUID4-based string will be generated.
-        owner: Name or identifier of the account owner.
-        balance: Current balance as Decimal (always >= 0).
-        currency: Currency code (informational only), default 'USD'.
+    id: str
+    balance: Decimal
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """Represents an immutable ledger entry for an account operation."""
+
+    timestamp: datetime
+    account_id: str
+    type: str  # 'create', 'deposit', 'withdrawal'
+    amount: Decimal
+    balance_after: Decimal
+    memo: Optional[str] = None
+
+
+class AccountService:
+    """
+    Service for managing accounts, balances, deposits, and withdrawals with
+    validation and immutable ledger logging.
+
+    - Uses Decimal for monetary values with configurable precision (default 2).
+    - Provides methods to create accounts, deposit, withdraw, and query balances.
+    - Maintains a chronological ledger of all operations per-account and globally.
+    - Thread-safe for concurrent operations within a single process.
     """
 
-    owner: str
-    account_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    balance: Decimal = field(default_factory=lambda: Decimal('0.00'))
-    currency: str = 'USD'
+    def __init__(self, decimal_places: int = 2, rounding=ROUND_HALF_EVEN) -> None:
+        if decimal_places < 0:
+            raise ValueError("decimal_places must be non-negative")
+        # Quantization unit, e.g., 2 -> Decimal('0.01')
+        self._quant: Decimal = Decimal(10) ** (-decimal_places)
+        self._rounding = rounding
 
-    # Internal lock to make deposit/withdraw thread-safe
-    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+        self._accounts: Dict[str, Account] = {}
+        self._ledger: List[LedgerEntry] = []
+        self._per_account_ledger: Dict[str, List[LedgerEntry]] = {}
+        self._lock = threading.RLock()
 
-    def __post_init__(self) -> None:
-        # Ensure balance is a Decimal with two decimal places and non-negative
-        self.balance = _to_decimal(self.balance)
-        if self.balance < 0:
-            raise InvalidAmountError("Initial balance cannot be negative")
-
-    @classmethod
-    def create(cls, owner: str, initial_deposit: Optional[object] = 0, currency: str = 'USD', account_id: Optional[str] = None) -> 'Account':
-        """Factory method to create a new Account.
+    # ---------------------------- Public API ----------------------------
+    def create_account(
+        self,
+        account_id: Optional[str] = None,
+        initial_balance: Union[Decimal, int, float, str] = 0,
+        memo: Optional[str] = None,
+    ) -> str:
+        """
+        Create a new account with an optional initial balance.
 
         Args:
-            owner: Owner name or identifier (required).
-            initial_deposit: Initial balance (defaults to 0). Must be >= 0.
-            currency: Currency code string (informational).
-            account_id: Optional explicit account id. If omitted a UUID is used.
+            account_id: Optional explicit account identifier. If None, a UUID4 hex is generated.
+            initial_balance: Non-negative initial balance. Defaults to 0.
+            memo: Optional note to include in the creation ledger entry.
+
+        Returns:
+            The account identifier.
+
+        Raises:
+            AccountAlreadyExistsError: If the specified account_id already exists.
+            InvalidAmountError: If initial_balance is negative or not a valid amount.
         """
-        if not owner:
-            raise ValueError("owner must be provided")
-
-        balance = _to_decimal(initial_deposit)
-        if balance < 0:
-            raise InvalidAmountError("Initial deposit must be non-negative")
-
-        acct_id = account_id if account_id is not None else str(uuid.uuid4())
-        return cls(owner=owner, account_id=acct_id, balance=balance, currency=currency)
-
-    def deposit(self, amount: object) -> Decimal:
-        """Deposit a positive amount into the account.
-
-        Returns the new balance.
-        """
-        dec_amount = _to_decimal(amount)
-        if dec_amount <= Decimal('0'):
-            raise InvalidAmountError("Deposit amount must be positive")
-
         with self._lock:
-            self.balance = (self.balance + dec_amount).quantize(_CENT, rounding=ROUND_HALF_UP)
-            return self.balance
+            aid = account_id or uuid.uuid4().hex
+            if aid in self._accounts:
+                raise AccountAlreadyExistsError(f"Account '{aid}' already exists")
 
-    def withdraw(self, amount: object) -> Decimal:
-        """Withdraw a positive amount from the account.
+            amount = self._to_decimal(initial_balance)
+            if amount < Decimal(0):
+                raise InvalidAmountError("Initial balance cannot be negative")
 
-        Raises InsufficientFundsError if the requested amount exceeds the
-        available balance. Returns the new balance.
+            now = datetime.now(timezone.utc)
+            account = Account(id=aid, balance=amount, created_at=now)
+            self._accounts[aid] = account
+            self._per_account_ledger[aid] = []
+
+            # Log creation (amount may be zero)
+            self._log(
+                account_id=aid,
+                type_="create",
+                amount=amount,
+                balance_after=amount,
+                memo=memo,
+                timestamp=now,
+            )
+            return aid
+
+    def deposit(self, account_id: str, amount: Union[Decimal, int, float, str], memo: Optional[str] = None) -> Decimal:
         """
-        dec_amount = _to_decimal(amount)
-        if dec_amount <= Decimal('0'):
-            raise InvalidAmountError("Withdrawal amount must be positive")
+        Deposit a positive amount into the specified account.
 
+        Args:
+            account_id: The account identifier.
+            amount: The amount to deposit (must be > 0).
+            memo: Optional note to include in the ledger entry.
+
+        Returns:
+            The new balance as a Decimal.
+
+        Raises:
+            AccountNotFoundError: If the account does not exist.
+            InvalidAmountError: If amount is not valid or not strictly positive.
+        """
         with self._lock:
-            if dec_amount > self.balance:
-                raise InsufficientFundsError(f"Insufficient funds: requested {dec_amount}, available {self.balance}")
-            self.balance = (self.balance - dec_amount).quantize(_CENT, rounding=ROUND_HALF_UP)
-            return self.balance
+            account = self._get_account(account_id)
+            dec_amount = self._to_decimal(amount)
+            if dec_amount <= Decimal(0):
+                raise InvalidAmountError("Deposit amount must be greater than zero")
 
-    def get_balance(self) -> Decimal:
-        """Return the current balance as Decimal.
+            new_balance = (account.balance + dec_amount).quantize(self._quant, rounding=self._rounding)
+            account.balance = new_balance
 
-        The returned Decimal is already quantized to two decimal places.
+            self._log(
+                account_id=account_id,
+                type_="deposit",
+                amount=dec_amount,
+                balance_after=new_balance,
+                memo=memo,
+            )
+            return new_balance
+
+    def withdraw(self, account_id: str, amount: Union[Decimal, int, float, str], memo: Optional[str] = None) -> Decimal:
         """
-        # Return a copy to avoid accidental external mutation
-        return Decimal(self.balance)
+        Withdraw a positive amount from the specified account.
 
-    def to_dict(self) -> Dict[str, object]:
-        """Serialize core account information to a dict."""
-        return {
-            'account_id': self.account_id,
-            'owner': self.owner,
-            'balance': str(self.balance),
-            'currency': self.currency,
-        }
+        Args:
+            account_id: The account identifier.
+            amount: The amount to withdraw (must be > 0 and <= balance).
+            memo: Optional note to include in the ledger entry.
 
-    def __repr__(self) -> str:
-        return f"Account(account_id={self.account_id!r}, owner={self.owner!r}, balance={str(self.balance)!r}, currency={self.currency!r})"
+        Returns:
+            The new balance as a Decimal.
+
+        Raises:
+            AccountNotFoundError: If the account does not exist.
+            InvalidAmountError: If amount is not valid or not strictly positive.
+            InsufficientFundsError: If the amount exceeds the available balance.
+        """
+        with self._lock:
+            account = self._get_account(account_id)
+            dec_amount = self._to_decimal(amount)
+            if dec_amount <= Decimal(0):
+                raise InvalidAmountError("Withdrawal amount must be greater than zero")
+            if dec_amount > account.balance:
+                raise InsufficientFundsError("Insufficient funds for withdrawal")
+
+            new_balance = (account.balance - dec_amount).quantize(self._quant, rounding=self._rounding)
+            account.balance = new_balance
+
+            self._log(
+                account_id=account_id,
+                type_="withdrawal",
+                amount=dec_amount,
+                balance_after=new_balance,
+                memo=memo,
+            )
+            return new_balance
+
+    def get_balance(self, account_id: str) -> Decimal:
+        """Return the current balance of the specified account."""
+        with self._lock:
+            account = self._get_account(account_id)
+            return account.balance
+
+    def get_ledger(self, account_id: Optional[str] = None) -> List[LedgerEntry]:
+        """
+        Retrieve the ledger entries.
+
+        Args:
+            account_id: If provided, returns entries for that account only. Otherwise, returns all entries.
+
+        Returns:
+            A new list of LedgerEntry instances in chronological order.
+
+        Raises:
+            AccountNotFoundError: If account_id is provided but the account does not exist.
+        """
+        with self._lock:
+            if account_id is None:
+                return list(self._ledger)
+            # Validate account exists
+            self._get_account(account_id)
+            return list(self._per_account_ledger.get(account_id, []))
+
+    def list_accounts(self) -> List[str]:
+        """Return a list of all account IDs."""
+        with self._lock:
+            return list(self._accounts.keys())
+
+    # --------------------------- Internal Utils ---------------------------
+    def _to_decimal(self, value: Union[Decimal, int, float, str]) -> Decimal:
+        """Convert a numeric value to a quantized Decimal using the service's precision and rounding."""
+        try:
+            if isinstance(value, Decimal):
+                dec = value
+            elif isinstance(value, int):
+                dec = Decimal(value)
+            elif isinstance(value, float):
+                # Convert via str to avoid binary floating point surprises
+                dec = Decimal(str(value))
+            elif isinstance(value, str):
+                dec = Decimal(value)
+            else:
+                raise InvalidAmountError(f"Unsupported amount type: {type(value)!r}")
+            return dec.quantize(self._quant, rounding=self._rounding)
+        except (InvalidOperation, ValueError) as exc:
+            raise InvalidAmountError("Invalid monetary amount") from exc
+
+    def _get_account(self, account_id: str) -> Account:
+        account = self._accounts.get(account_id)
+        if account is None:
+            raise AccountNotFoundError(f"Account '{account_id}' not found")
+        return account
+
+    def _log(
+        self,
+        account_id: str,
+        type_: str,
+        amount: Decimal,
+        balance_after: Decimal,
+        memo: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        entry = LedgerEntry(
+            timestamp=timestamp or datetime.now(timezone.utc),
+            account_id=account_id,
+            type=type_,
+            amount=amount,
+            balance_after=balance_after,
+            memo=memo,
+        )
+        self._ledger.append(entry)
+        self._per_account_ledger.setdefault(account_id, []).append(entry)

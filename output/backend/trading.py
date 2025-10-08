@@ -1,284 +1,285 @@
-"""
-# trading.py
-
-TradingEngine: executes buy/sell orders with validation, updates account cash
-and portfolio holdings, and records transactions and realized profit/loss.
-
-This module is intended to be used alongside the other backend modules in
-this package (accounts, account_service, portfolio, portfolio_repository,
-transaction, transaction_repository, pricing, validators). It is self-
-contained in that it only imports from the local package and the standard
-library.
-"""
-
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import Optional, Any
-
-# Relative imports from package
-from .account_service import AccountService
-from .portfolio_repository import PortfolioRepository
-from .transaction_repository import TransactionRepository
-from .pricing import PriceService, UnsupportedSymbolError as PricingUnsupported
-from .validators import (
-    OperationValidator,
-    InsufficientFundsError,
-    UnsupportedSymbolError as ValidatorUnsupported,
-    InsufficientHoldingsError,
-    InvalidAmountError as ValidatorInvalidAmount,
-)
-from .transaction import Transaction
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
+from typing import Dict, List, Optional, Union
+import threading
+import uuid
 
 
 class TradingError(Exception):
-    """Base exception for trading-related errors."""
+    """Base class for trading-related errors."""
+
+
+class AccountNotFoundError(TradingError):
+    """Raised when an account does not exist in the trading engine."""
+
+
+class AccountAlreadyExistsError(TradingError):
+    """Raised when an account with the given ID already exists."""
+
+
+class InvalidOrderError(TradingError):
+    """Raised when an order has invalid parameters (e.g., non-positive quantity or price)."""
+
+
+class InsufficientCashError(TradingError):
+    """Raised when there is not enough cash to execute a buy order."""
+
+
+class InsufficientHoldingsError(TradingError):
+    """Raised when there are not enough holdings to execute a sell order."""
+
+
+@dataclass
+class AccountPortfolio:
+    """Represents an account portfolio containing cash and a creation timestamp."""
+
+    id: str
+    cash_balance: Decimal
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class TradeRecord:
+    """Immutable trade record for a buy or sell execution."""
+
+    timestamp: datetime
+    account_id: str
+    side: str  # 'buy' or 'sell'
+    symbol: str
+    quantity: Decimal
+    price: Decimal
+    total: Decimal  # money value of the trade; non-negative
+    cash_balance_after: Decimal
+    position_after: Decimal  # position for the traded symbol after execution
+    memo: Optional[str] = None
 
 
 class TradingEngine:
-    """Execute buy and sell orders, update accounts and portfolios, and
-    persist transactions.
+    """
+    Trading engine that executes buy/sell orders, validates operations,
+    updates cash balances and holdings, and records immutable trade entries.
 
-    The engine is intentionally thin: it wires together an AccountService,
-    a PortfolioRepository, a TransactionRepository, a PriceService, and
-    an OperationValidator. If callers do not provide these objects sensible
-    defaults (in-memory ones) are created.
-
-    Typical usage:
-        engine = TradingEngine()
-        tx = engine.buy(account_id='acct-1', portfolio_id='p-1', symbol='AAPL', quantity='1', use_market_price=True)
-
-    Methods return the created Transaction object on success.
+    - Uses Decimal for monetary and quantity values with configurable precision.
+    - Thread-safe for concurrent operations within a single process.
+    - Maintains global and per-account trade ledgers.
     """
 
     def __init__(
         self,
-        account_service: Optional[AccountService] = None,
-        portfolio_repo: Optional[PortfolioRepository] = None,
-        transaction_repo: Optional[TransactionRepository] = None,
-        price_service: Optional[PriceService] = None,
-        validator: Optional[OperationValidator] = None,
+        cash_decimal_places: int = 2,
+        qty_decimal_places: int = 8,
+        rounding=ROUND_HALF_EVEN,
     ) -> None:
-        self.account_service = account_service if account_service is not None else AccountService()
-        self.portfolio_repo = portfolio_repo if portfolio_repo is not None else PortfolioRepository()
-        self.transaction_repo = transaction_repo if transaction_repo is not None else TransactionRepository()
-        self.price_service = price_service if price_service is not None else PriceService()
-        self.validator = validator if validator is not None else OperationValidator()
+        if cash_decimal_places < 0:
+            raise ValueError("cash_decimal_places must be non-negative")
+        if qty_decimal_places < 0:
+            raise ValueError("qty_decimal_places must be non-negative")
 
-    def _resolve_price(self, symbol: str, price: Optional[Any], use_market_price: bool) -> Decimal:
-        """Return a Decimal price (already quantized by PriceService or Transaction).
+        self._cash_q: Decimal = Decimal(10) ** (-cash_decimal_places)
+        self._qty_q: Decimal = Decimal(10) ** (-qty_decimal_places)
+        self._rounding = rounding
 
-        If use_market_price is True the price is fetched from PriceService.
-        Otherwise a provided price must be present.
+        self._accounts: Dict[str, AccountPortfolio] = {}
+        self._holdings: Dict[str, Dict[str, Decimal]] = {}
+        self._trades: List[TradeRecord] = []
+        self._per_account_trades: Dict[str, List[TradeRecord]] = {}
+        self._lock = threading.RLock()
+
+    # ---------------------------- Public API ----------------------------
+    def create_account(
+        self,
+        account_id: Optional[str] = None,
+        initial_cash: Union[Decimal, int, float, str] = 0,
+    ) -> str:
         """
-        if use_market_price:
-            try:
-                return self.price_service.get_share_price(symbol)
-            except Exception as exc:
-                # Normalize pricing errors
-                raise TradingError(f"failed to obtain market price for {symbol}: {exc}") from exc
+        Create a new trading account with an optional initial cash balance.
 
-        if price is None:
-            raise TradingError("price must be provided when use_market_price is False")
+        Args:
+            account_id: Optional explicit account identifier. If None, a UUID4 hex is generated.
+            initial_cash: Non-negative initial cash balance.
 
-        # Let Transaction.trade/_to_decimal handle normalization; just return as-is
-        return Decimal(price)
+        Returns:
+            The account identifier.
 
-    def buy(
+        Raises:
+            AccountAlreadyExistsError: If the specified account_id already exists.
+            InvalidOrderError: If initial_cash is negative or not a valid amount.
+        """
+        with self._lock:
+            aid = account_id or uuid.uuid4().hex
+            if aid in self._accounts:
+                raise AccountAlreadyExistsError(f"Account '{aid}' already exists")
+
+            cash = self._to_decimal(initial_cash, quant=self._cash_q)
+            if cash < Decimal(0):
+                raise InvalidOrderError("Initial cash cannot be negative")
+
+            now = datetime.now(timezone.utc)
+            acct = AccountPortfolio(id=aid, cash_balance=cash, created_at=now)
+            self._accounts[aid] = acct
+            self._holdings[aid] = {}
+            self._per_account_trades[aid] = []
+            return aid
+
+    def place_order(
         self,
         account_id: str,
-        portfolio_id: str,
+        side: str,
         symbol: str,
-        quantity: object,
-        price: Optional[object] = None,
-        use_market_price: bool = False,
-        transaction_id: Optional[str] = None,
-    ) -> Transaction:
-        """Execute a buy: validate funds, withdraw cash, update holdings, record transaction.
-
-        Returns the created Transaction.
+        quantity: Union[Decimal, int, float, str],
+        price: Union[Decimal, int, float, str],
+        memo: Optional[str] = None,
+    ) -> TradeRecord:
         """
-        # Validate symbol
-        try:
-            norm_symbol = self.validator.validate_symbol(symbol)
-        except Exception as exc:
-            raise TradingError(f"invalid or unsupported symbol: {symbol}") from exc
+        Execute a buy or sell order for the given account and symbol.
 
-        # Resolve price (Decimal-like or convertible)
-        resolved_price = None
-        try:
-            resolved_price = self._resolve_price(norm_symbol, price, use_market_price)
-        except Exception:
-            raise
+        Args:
+            account_id: The account identifier.
+            side: 'buy' or 'sell' (case-insensitive).
+            symbol: Asset symbol (non-empty string).
+            quantity: Quantity to trade (must be > 0).
+            price: Price per unit (must be > 0).
+            memo: Optional note stored in the trade record.
 
-        # Create a transaction object to determine the required amount and validate quantity/price
-        try:
-            tx = Transaction.trade(account_id=account_id, side='buy', quantity=quantity, price=resolved_price, transaction_id=transaction_id)
-        except Exception as exc:
-            raise TradingError(f"invalid trade parameters: {exc}") from exc
+        Returns:
+            TradeRecord describing the executed trade.
 
-        # Validate sufficient funds in account
-        try:
-            acct = self.account_service.get_account(account_id)
-        except Exception as exc:
-            raise TradingError(f"account not found: {account_id}") from exc
-
-        try:
-            # validate_sufficient_funds will normalize the amount and raise if insufficient
-            self.validator.validate_sufficient_funds(acct.get_balance(), tx.amount)
-        except InsufficientFundsError as exc:
-            raise
-        except Exception as exc:
-            # Normalize any other validation to TradingError
-            raise TradingError(f"funds validation failed: {exc}") from exc
-
-        # Withdraw funds (this will persist via AccountService)
-        try:
-            self.account_service.withdraw(account_id, tx.amount)
-        except Exception as exc:
-            # Propagate known account-related exceptions
-            raise
-
-        # Update portfolio holdings
-        try:
-            portfolio = self.portfolio_repo.get(portfolio_id)
-            if portfolio is None:
-                raise TradingError(f"portfolio not found: {portfolio_id}")
-            # portfolio.buy will validate and mutate the holding; it may raise
-            portfolio.buy(norm_symbol, quantity, resolved_price)
-            # persist portfolio
-            self.portfolio_repo.save(portfolio)
-        except Exception as exc:
-            # If portfolio update fails attempt to refund the withdrawn amount
-            try:
-                self.account_service.deposit(account_id, tx.amount)
-            except Exception:
-                raise TradingError("failed to update portfolio and failed to refund account; inconsistent state") from exc
-            raise
-
-        # Record transaction (include created transaction object)
-        try:
-            # We already have tx constructed earlier; ensure transaction amount/price/quantity as stored
-            self.transaction_repo.save(tx)
-        except Exception as exc:
-            # Persistent failure: attempt to roll back portfolio and account
-            try:
-                # rollback portfolio by selling the same quantity at the same price
-                # Note: this may not perfectly restore average_cost but restores quantity
-                portfolio.sell(norm_symbol, quantity, resolved_price)
-                self.portfolio_repo.save(portfolio)
-            except Exception:
-                pass
-            try:
-                self.account_service.deposit(account_id, tx.amount)
-            except Exception:
-                pass
-            raise TradingError(f"failed to persist transaction: {exc}") from exc
-
-        return tx
-
-    def sell(
-        self,
-        account_id: str,
-        portfolio_id: str,
-        symbol: str,
-        quantity: object,
-        price: Optional[object] = None,
-        use_market_price: bool = False,
-        transaction_id: Optional[str] = None,
-    ) -> Transaction:
-        """Execute a sell: validate holdings, update holdings (realize P/L), deposit proceeds, record transaction.
-
-        Returns the created Transaction (which includes profit_loss when available).
+        Raises:
+            AccountNotFoundError: If the account does not exist.
+            InvalidOrderError: If side/symbol/quantity/price are invalid.
+            InsufficientCashError: If cash is insufficient for a buy order.
+            InsufficientHoldingsError: If holdings are insufficient for a sell order.
         """
-        # Validate symbol
+        with self._lock:
+            account = self._get_account(account_id)
+
+            norm_side = (side or "").strip().lower()
+            if norm_side not in {"buy", "sell"}:
+                raise InvalidOrderError("side must be 'buy' or 'sell'")
+
+            sym = (symbol or "").strip()
+            if not sym:
+                raise InvalidOrderError("symbol must be a non-empty string")
+
+            qty = self._to_decimal(quantity, quant=self._qty_q)
+            px = self._to_decimal(price, quant=self._cash_q)
+
+            if qty <= Decimal(0):
+                raise InvalidOrderError("quantity must be greater than zero")
+            if px <= Decimal(0):
+                raise InvalidOrderError("price must be greater than zero")
+
+            total = (qty * px).quantize(self._cash_q, rounding=self._rounding)
+
+            holdings = self._holdings[account_id]
+            current_pos = holdings.get(sym, Decimal(0))
+
+            if norm_side == "buy":
+                if account.cash_balance < total:
+                    raise InsufficientCashError("Insufficient cash for buy order")
+                # Update balances
+                new_cash = (account.cash_balance - total).quantize(self._cash_q, rounding=self._rounding)
+                new_pos = (current_pos + qty).quantize(self._qty_q, rounding=self._rounding)
+                account.cash_balance = new_cash
+                holdings[sym] = new_pos
+            else:  # sell
+                if qty > current_pos:
+                    raise InsufficientHoldingsError("Insufficient holdings for sell order")
+                new_cash = (account.cash_balance + total).quantize(self._cash_q, rounding=self._rounding)
+                new_pos = (current_pos - qty).quantize(self._qty_q, rounding=self._rounding)
+                account.cash_balance = new_cash
+                if new_pos == Decimal(0):
+                    holdings.pop(sym, None)
+                else:
+                    holdings[sym] = new_pos
+
+            record = TradeRecord(
+                timestamp=datetime.now(timezone.utc),
+                account_id=account_id,
+                side=norm_side,
+                symbol=sym,
+                quantity=qty,
+                price=px,
+                total=total,
+                cash_balance_after=account.cash_balance,
+                position_after=holdings.get(sym, Decimal(0)),
+                memo=memo,
+            )
+            self._log_trade(record)
+            return record
+
+    def get_cash_balance(self, account_id: str) -> Decimal:
+        """Return the current cash balance for the specified account."""
+        with self._lock:
+            return self._get_account(account_id).cash_balance
+
+    def get_positions(self, account_id: str) -> Dict[str, Decimal]:
+        """Return a shallow copy of the symbol->quantity positions for the account."""
+        with self._lock:
+            self._ensure_account_exists(account_id)
+            return dict(self._holdings.get(account_id, {}))
+
+    def get_position(self, account_id: str, symbol: str) -> Decimal:
+        """Return the position size for a symbol in the given account (zero if none)."""
+        with self._lock:
+            self._ensure_account_exists(account_id)
+            return self._holdings.get(account_id, {}).get(symbol, Decimal(0))
+
+    def get_trades(self, account_id: Optional[str] = None) -> List[TradeRecord]:
+        """
+        Retrieve trade records.
+
+        Args:
+            account_id: If provided, returns trades for that account; otherwise returns all trades.
+
+        Returns:
+            A new list of TradeRecord instances in chronological order.
+
+        Raises:
+            AccountNotFoundError: If account_id is provided but does not exist.
+        """
+        with self._lock:
+            if account_id is None:
+                return list(self._trades)
+            self._ensure_account_exists(account_id)
+            return list(self._per_account_trades.get(account_id, []))
+
+    def list_accounts(self) -> List[str]:
+        """Return a list of all account IDs known to the engine."""
+        with self._lock:
+            return list(self._accounts.keys())
+
+    # --------------------------- Internal Utils ---------------------------
+    def _to_decimal(self, value: Union[Decimal, int, float, str], *, quant: Decimal) -> Decimal:
+        """Convert a numeric value to a quantized Decimal using provided precision and engine's rounding."""
         try:
-            norm_symbol = self.validator.validate_symbol(symbol)
-        except Exception as exc:
-            raise TradingError(f"invalid or unsupported symbol: {symbol}") from exc
+            if isinstance(value, Decimal):
+                dec = value
+            elif isinstance(value, int):
+                dec = Decimal(value)
+            elif isinstance(value, float):
+                dec = Decimal(str(value))
+            elif isinstance(value, str):
+                dec = Decimal(value)
+            else:
+                raise InvalidOrderError(f"Unsupported numeric type: {type(value)!r}")
+            return dec.quantize(quant, rounding=self._rounding)
+        except (InvalidOperation, ValueError) as exc:
+            raise InvalidOrderError("Invalid numeric amount") from exc
 
-        # Resolve price
-        try:
-            resolved_price = self._resolve_price(norm_symbol, price, use_market_price)
-        except Exception:
-            raise
+    def _get_account(self, account_id: str) -> AccountPortfolio:
+        acct = self._accounts.get(account_id)
+        if acct is None:
+            raise AccountNotFoundError(f"Account '{account_id}' not found")
+        return acct
 
-        # Fetch portfolio and ensure holding exists and sufficient
-        portfolio = self.portfolio_repo.get(portfolio_id)
-        if portfolio is None:
-            raise TradingError(f"portfolio not found: {portfolio_id}")
+    def _ensure_account_exists(self, account_id: str) -> None:
+        if account_id not in self._accounts:
+            raise AccountNotFoundError(f"Account '{account_id}' not found")
 
-        holding = portfolio.get_holding(norm_symbol)
-        if holding is None:
-            # Align with validator exception types
-            raise InsufficientHoldingsError(f"no holding for symbol: {norm_symbol}")
-
-        # Validate sufficient quantity
-        try:
-            self.validator.validate_sufficient_quantity(holding.quantity, quantity)
-        except Exception as exc:
-            raise
-
-        # Perform the sell on the portfolio (this reduces quantity and returns realized pnl)
-        try:
-            pnl = portfolio.sell(norm_symbol, quantity, resolved_price)
-            # persist portfolio
-            self.portfolio_repo.save(portfolio)
-        except Exception as exc:
-            raise
-
-        # Create transaction with realized P/L
-        try:
-            tx = Transaction.trade(account_id=account_id, side='sell', quantity=quantity, price=resolved_price, profit_loss=pnl, transaction_id=transaction_id)
-        except Exception as exc:
-            # Attempt to roll back portfolio change by buying back the quantity at the same price
-            try:
-                portfolio.buy(norm_symbol, quantity, resolved_price)
-                self.portfolio_repo.save(portfolio)
-            except Exception:
-                pass
-            raise TradingError(f"failed to construct sell transaction: {exc}") from exc
-
-        # Deposit proceeds to account
-        try:
-            self.account_service.deposit(account_id, tx.amount)
-        except Exception as exc:
-            # Attempt to roll back portfolio change
-            try:
-                portfolio.buy(norm_symbol, quantity, resolved_price)
-                self.portfolio_repo.save(portfolio)
-            except Exception:
-                raise TradingError("failed to deposit proceeds and rollback failed; inconsistent state") from exc
-            raise
-
-        # Persist transaction
-        try:
-            self.transaction_repo.save(tx)
-        except Exception as exc:
-            # best-effort: attempt rollback (withdraw proceeds and buy back holdings)
-            try:
-                self.account_service.withdraw(account_id, tx.amount)
-            except Exception:
-                pass
-            try:
-                portfolio.buy(norm_symbol, quantity, resolved_price)
-                self.portfolio_repo.save(portfolio)
-            except Exception:
-                pass
-            raise TradingError(f"failed to persist transaction: {exc}") from exc
-
-        return tx
-
-    def list_transactions_for_account(self, account_id: str):
-        """Return transactions referencing the given account id."""
-        return self.transaction_repo.list_for_account(account_id)
-
-    def get_portfolio_holdings(self, portfolio_id: str):
-        """Return holdings list for the given portfolio id."""
-        p = self.portfolio_repo.get(portfolio_id)
-        if p is None:
-            raise TradingError(f"portfolio not found: {portfolio_id}")
-        return p.list_holdings()
-
-
-__all__ = ['TradingEngine', 'TradingError']
+    def _log_trade(self, record: TradeRecord) -> None:
+        self._trades.append(record)
+        self._per_account_trades.setdefault(record.account_id, []).append(record)

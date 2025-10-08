@@ -1,184 +1,390 @@
-# portfolio.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP, getcontext
-from threading import RLock
-from typing import Dict, Optional, Callable, Iterable, List
-
-# Relative import to reuse the Holding implementation
-from .holding import (
-    Holding,
-    HoldingError,
-    InvalidQuantityError,
-    InvalidPriceError,
-    InsufficientQuantityError,
-)
-
-# Ensure sufficient precision
-getcontext().prec = 28
-
-_CENT = Decimal('0.01')
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
+from typing import Dict, List, Optional, Union, Mapping
+import threading
+import uuid
 
 
 class PortfolioError(Exception):
     """Base class for portfolio-related errors."""
 
-class PortfolioNotFoundError(PortfolioError, KeyError):
-    """Raised when a requested holding is not found."""
+
+class PortfolioNotFoundError(PortfolioError):
+    """Raised when a portfolio does not exist."""
+
+
+class PortfolioAlreadyExistsError(PortfolioError):
+    """Raised when attempting to create a duplicate portfolio."""
+
+
+class InvalidTradeError(PortfolioError):
+    """Raised when a trade has invalid parameters (e.g., non-positive quantity or price)."""
+
+
+class InsufficientHoldingsError(PortfolioError):
+    """Raised when there are not enough holdings to execute a sell trade."""
+
+
+@dataclass
+class Position:
+    """Represents a position for a single symbol with quantity and total cost basis.
+
+    - quantity: The current position size (>= 0)
+    - total_cost: Aggregate cost basis for the entire position in cash units (>= 0)
+    """
+
+    symbol: str
+    quantity: Decimal
+    total_cost: Decimal
+
+    def avg_cost(self, *, quant: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
+        """Return the average cost per unit for the position (0 if quantity is zero)."""
+        if self.quantity == Decimal(0):
+            return Decimal(0).quantize(quant, rounding=rounding)
+        return (self.total_cost / self.quantity).quantize(quant, rounding=rounding)
+
+
+@dataclass(frozen=True)
+class TradeRecord:
+    """Immutable record of a trade applied to a portfolio."""
+
+    timestamp: datetime
+    portfolio_id: str
+    side: str  # 'buy' or 'sell'
+    symbol: str
+    quantity: Decimal
+    price: Decimal
+    total: Decimal  # money value (quantity * price), non-negative
+    position_after: Decimal  # quantity after applying the trade
+    avg_cost_after: Decimal  # average cost per unit after the trade
+    realized_pnl: Decimal  # realized P&L from this trade (zero for buys)
+    memo: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PositionValuation:
+    """Valuation details for a single symbol within a portfolio."""
+
+    symbol: str
+    quantity: Decimal
+    price: Decimal
+    market_value: Decimal
+    avg_cost: Decimal
+    unrealized_pnl: Decimal
+
+
+@dataclass(frozen=True)
+class PortfolioValuation:
+    """Aggregated portfolio valuation information."""
+
+    portfolio_id: str
+    timestamp: datetime
+    total_market_value: Decimal
+    total_unrealized_pnl: Decimal
+    realized_pnl_to_date: Decimal
+    positions: List[PositionValuation]
 
 
 @dataclass
 class Portfolio:
-    """Tracks holdings for an account and updates positions/cost basis on trades.
+    """A portfolio composed of holdings and cumulative realized P&L."""
 
-    Attributes:
-        portfolio_id: unique portfolio identifier (string)
-        owner: owner identifier (string)
-        account_id: optional linked account id
-        currency: informational currency code (defaults to 'USD')
-        holdings: mapping of symbol -> Holding objects
+    id: str
+    created_at: datetime
+    realized_pnl: Decimal
+    holdings: Dict[str, Position]
+
+
+class PortfolioService:
+    """
+    Tracks holdings and computes portfolio value and P/L (realized/unrealized) using pricing data.
+
+    - Records buy/sell trades to maintain quantities and average cost basis.
+    - Computes realized P&L on sells and unrealized P&L using provided pricing data.
+    - Uses Decimal for monetary amounts and quantities with configurable precision.
+    - Thread-safe for concurrent operations within a single process.
     """
 
-    portfolio_id: str
-    owner: str
-    account_id: Optional[str] = None
-    currency: str = 'USD'
+    def __init__(
+        self,
+        cash_decimal_places: int = 2,
+        qty_decimal_places: int = 8,
+        rounding=ROUND_HALF_EVEN,
+    ) -> None:
+        if cash_decimal_places < 0:
+            raise ValueError("cash_decimal_places must be non-negative")
+        if qty_decimal_places < 0:
+            raise ValueError("qty_decimal_places must be non-negative")
 
-    # internal holdings map and lock for thread-safety
-    _holdings: Dict[str, Holding] = field(default_factory=dict, init=False, repr=False)
-    _lock: RLock = field(default_factory=RLock, init=False, repr=False)
+        self._cash_q: Decimal = Decimal(10) ** (-cash_decimal_places)
+        self._qty_q: Decimal = Decimal(10) ** (-qty_decimal_places)
+        self._rounding = rounding
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.portfolio_id, str) or not self.portfolio_id:
-            raise ValueError('portfolio_id must be a non-empty string')
-        if not isinstance(self.owner, str) or not self.owner:
-            raise ValueError('owner must be a non-empty string')
+        self._portfolios: Dict[str, Portfolio] = {}
+        self._trades: List[TradeRecord] = []
+        self._per_portfolio_trades: Dict[str, List[TradeRecord]] = {}
+        self._lock = threading.RLock()
 
-    # --- Holdings management ---------------------------------------
-    def _normalize_symbol(self, symbol: str) -> str:
-        if not isinstance(symbol, str) or not symbol:
-            raise ValueError('symbol must be a non-empty string')
-        return symbol.strip()
+    # ---------------------------- Public API ----------------------------
+    def create_portfolio(self, portfolio_id: Optional[str] = None) -> str:
+        """Create a new, empty portfolio and return its identifier.
 
-    def add_holding(self, holding: Holding) -> None:
-        """Add or replace a Holding in the portfolio.
+        Args:
+            portfolio_id: Optional explicit portfolio identifier. If None, a UUID4 hex is generated.
 
-        The holding's symbol is used as the key. Replaces any existing holding
-        with the same symbol.
+        Raises:
+            PortfolioAlreadyExistsError: If the specified portfolio_id already exists.
         """
-        if not isinstance(holding, Holding):
-            raise TypeError('holding must be a Holding instance')
-        sym = self._normalize_symbol(holding.symbol)
         with self._lock:
-            self._holdings[sym] = holding
+            pid = portfolio_id or uuid.uuid4().hex
+            if pid in self._portfolios:
+                raise PortfolioAlreadyExistsError(f"Portfolio '{pid}' already exists")
 
-    def get_holding(self, symbol: str) -> Optional[Holding]:
-        """Return the Holding for symbol or None if not present."""
-        sym = self._normalize_symbol(symbol)
-        with self._lock:
-            return self._holdings.get(sym)
+            now = datetime.now(timezone.utc)
+            self._portfolios[pid] = Portfolio(
+                id=pid,
+                created_at=now,
+                realized_pnl=Decimal(0).quantize(self._cash_q, rounding=self._rounding),
+                holdings={},
+            )
+            self._per_portfolio_trades[pid] = []
+            return pid
 
-    def list_holdings(self) -> List[Holding]:
-        """Return a list of holdings (a shallow copy)."""
-        with self._lock:
-            return list(self._holdings.values())
+    def record_trade(
+        self,
+        portfolio_id: str,
+        side: str,
+        symbol: str,
+        quantity: Union[Decimal, int, float, str],
+        price: Union[Decimal, int, float, str],
+        memo: Optional[str] = None,
+    ) -> TradeRecord:
+        """Record a buy or sell trade for the given portfolio and symbol.
 
-    def remove_holding(self, symbol: str) -> None:
-        """Remove a holding by symbol. Raises KeyError if missing."""
-        sym = self._normalize_symbol(symbol)
-        with self._lock:
-            if sym in self._holdings:
-                del self._holdings[sym]
-            else:
-                raise KeyError(sym)
+        Uses moving average cost basis:
+        - Buy: increases quantity and total cost. Average cost = total_cost / quantity.
+        - Sell: decreases quantity and reduces total cost by (avg_cost_before * qty_sold).
+          Realized P&L = proceeds - cost_portion.
 
-    # --- Trading operations ---------------------------------------
-    def buy(self, symbol: str, quantity: object, price: object) -> Holding:
-        """Buy quantity of symbol at price.
+        Args:
+            portfolio_id: Portfolio identifier.
+            side: 'buy' or 'sell' (case-insensitive).
+            symbol: Asset symbol (non-empty string).
+            quantity: Quantity to trade (must be > 0).
+            price: Price per unit (must be > 0).
+            memo: Optional note to store on the trade record.
 
-        Creates a new Holding if none exists. Returns the Holding after the
-        purchase. Raises Holding-related exceptions on invalid inputs.
+        Returns:
+            TradeRecord describing the applied trade.
+
+        Raises:
+            PortfolioNotFoundError: If the portfolio does not exist.
+            InvalidTradeError: If parameters are invalid.
+            InsufficientHoldingsError: If selling more than current position.
         """
-        sym = self._normalize_symbol(symbol)
         with self._lock:
-            holding = self._holdings.get(sym)
-            if holding is None:
-                # Create a new holding with zero quantity and zero average_cost
-                holding = Holding(symbol=sym, quantity=Decimal('0'), average_cost=Decimal('0.00'), currency=self.currency)
-                self._holdings[sym] = holding
-            # Delegate validation and state change to Holding.buy
-            holding.buy(quantity=quantity, price=price)
-            return holding
+            pf = self._get_portfolio(portfolio_id)
 
-    def sell(self, symbol: str, quantity: object, price: object) -> Decimal:
-        """Sell quantity of symbol at price.
+            norm_side = (side or "").strip().lower()
+            if norm_side not in {"buy", "sell"}:
+                raise InvalidTradeError("side must be 'buy' or 'sell'")
 
-        Returns realized P/L as Decimal (quantized to cents). If the sale
-        reduces the holding to zero quantity the holding is removed from the
-        portfolio. Raises Holding-related exceptions on invalid inputs.
-        """
-        sym = self._normalize_symbol(symbol)
-        with self._lock:
-            holding = self._holdings.get(sym)
-            if holding is None:
-                raise PortfolioNotFoundError(f'no holding for symbol: {sym}')
-            pnl = holding.sell(quantity=quantity, price=price)
-            # Remove if fully closed
-            if holding.quantity == Decimal('0').quantize(Decimal('0.00000001')):
-                del self._holdings[sym]
-            return pnl
+            sym = (symbol or "").strip()
+            if not sym:
+                raise InvalidTradeError("symbol must be a non-empty string")
 
-    # --- Valuation & utilities ------------------------------------
-    def market_value(self, price_provider: Optional[object] = None) -> Decimal:
-        """Compute total market value of the portfolio.
+            qty = self._to_decimal(quantity, quant=self._qty_q)
+            px = self._to_decimal(price, quant=self._cash_q)
 
-        price_provider can be:
-          - None: raises ValueError (price information required)
-          - mapping (dict-like): must provide price_provider[symbol]
-          - callable: called as price_provider(symbol) -> price
+            if qty <= Decimal(0):
+                raise InvalidTradeError("quantity must be greater than zero")
+            if px <= Decimal(0):
+                raise InvalidTradeError("price must be greater than zero")
 
-        Each holding's Holding.market_value is used so price inputs are
-        normalized consistently. The returned total is quantized to cents.
-        """
-        if price_provider is None:
-            raise ValueError('price_provider is required to compute market value')
+            holdings = pf.holdings
+            pos = holdings.get(sym, Position(symbol=sym, quantity=Decimal(0), total_cost=Decimal(0)))
 
-        total = Decimal('0.00')
-        with self._lock:
-            for sym, holding in self._holdings.items():
-                # obtain price
-                if callable(price_provider):
-                    price = price_provider(sym)
+            total = (qty * px).quantize(self._cash_q, rounding=self._rounding)
+            realized = Decimal(0).quantize(self._cash_q, rounding=self._rounding)
+
+            if norm_side == "buy":
+                new_qty = (pos.quantity + qty).quantize(self._qty_q, rounding=self._rounding)
+                new_total_cost = (pos.total_cost + total).quantize(self._cash_q, rounding=self._rounding)
+                pos.quantity = new_qty
+                pos.total_cost = new_total_cost
+                holdings[sym] = pos
+            else:  # sell
+                if qty > pos.quantity:
+                    raise InsufficientHoldingsError("Insufficient holdings for sell trade")
+
+                # Average cost before the sell
+                avg_cost_before = pos.avg_cost(quant=self._cash_q, rounding=self._rounding)
+                cost_portion = (avg_cost_before * qty).quantize(self._cash_q, rounding=self._rounding)
+                proceeds = total  # already qty * px, quantized to cash
+                realized = (proceeds - cost_portion).quantize(self._cash_q, rounding=self._rounding)
+
+                new_qty = (pos.quantity - qty).quantize(self._qty_q, rounding=self._rounding)
+                new_total_cost = (pos.total_cost - cost_portion).quantize(self._cash_q, rounding=self._rounding)
+
+                # If position is fully closed, reset totals to zero and remove symbol
+                if new_qty == Decimal(0):
+                    pos.quantity = Decimal(0)
+                    pos.total_cost = Decimal(0)
+                    holdings.pop(sym, None)
                 else:
-                    try:
-                        price = price_provider[sym]
-                    except Exception as exc:
-                        raise KeyError(f'price for {sym} not available') from exc
-                mv = holding.market_value(price)
-                total += mv
-        return total.quantize(_CENT, rounding=ROUND_HALF_UP)
+                    pos.quantity = new_qty
+                    pos.total_cost = new_total_cost
+                    holdings[sym] = pos
 
-    def to_dict(self) -> Dict[str, object]:
-        """Serialize portfolio core fields and holdings to a dict."""
+                # Accumulate realized P&L on the portfolio
+                pf.realized_pnl = (pf.realized_pnl + realized).quantize(self._cash_q, rounding=self._rounding)
+
+            avg_after = pos.avg_cost(quant=self._cash_q, rounding=self._rounding) if sym in holdings else Decimal(0).quantize(self._cash_q, rounding=self._rounding)
+            pos_after = holdings.get(sym).quantity if sym in holdings else Decimal(0)
+
+            record = TradeRecord(
+                timestamp=datetime.now(timezone.utc),
+                portfolio_id=portfolio_id,
+                side=norm_side,
+                symbol=sym,
+                quantity=qty,
+                price=px,
+                total=total,
+                position_after=pos_after,
+                avg_cost_after=avg_after,
+                realized_pnl=realized,
+                memo=memo,
+            )
+            self._log_trade(record)
+            return record
+
+    def get_positions(self, portfolio_id: str) -> Dict[str, Decimal]:
+        """Return a copy of the symbol->quantity mapping for the portfolio."""
         with self._lock:
-            holdings_list = [h.to_dict() for h in self._holdings.values()]
-        return {
-            'portfolio_id': self.portfolio_id,
-            'owner': self.owner,
-            'account_id': self.account_id,
-            'currency': self.currency,
-            'holdings': holdings_list,
-        }
+            self._ensure_portfolio_exists(portfolio_id)
+            return {s: p.quantity for s, p in self._portfolios[portfolio_id].holdings.items()}
 
-    def __repr__(self) -> str:
+    def get_position(self, portfolio_id: str, symbol: str) -> Decimal:
+        """Return the position size for a symbol (zero if none)."""
         with self._lock:
-            count = len(self._holdings)
-        return (f"Portfolio(portfolio_id={self.portfolio_id!r}, owner={self.owner!r}, holdings={count}, currency={self.currency!r})")
+            self._ensure_portfolio_exists(portfolio_id)
+            pos = self._portfolios[portfolio_id].holdings.get(symbol)
+            return pos.quantity if pos is not None else Decimal(0)
 
+    def get_trades(self, portfolio_id: Optional[str] = None) -> List[TradeRecord]:
+        """Retrieve trade records (global or per-portfolio)."""
+        with self._lock:
+            if portfolio_id is None:
+                return list(self._trades)
+            self._ensure_portfolio_exists(portfolio_id)
+            return list(self._per_portfolio_trades.get(portfolio_id, []))
 
-__all__ = [
-    'Portfolio',
-    'PortfolioError',
-    'PortfolioNotFoundError',
-]
+    def list_portfolios(self) -> List[str]:
+        """Return a list of all portfolio IDs."""
+        with self._lock:
+            return list(self._portfolios.keys())
+
+    def get_realized_pnl(self, portfolio_id: str) -> Decimal:
+        """Return cumulative realized P&L for the portfolio."""
+        with self._lock:
+            return self._get_portfolio(portfolio_id).realized_pnl
+
+    def value(
+        self,
+        portfolio_id: str,
+        prices: Mapping[str, Union[Decimal, int, float, str]],
+        *,
+        strict: bool = True,
+    ) -> PortfolioValuation:
+        """Compute portfolio valuation and unrealized P&L using provided prices.
+
+        Args:
+            portfolio_id: Portfolio identifier.
+            prices: Mapping of symbol -> price. Prices are converted and quantized to cash precision.
+            strict: If True, requires prices for all symbols (raises ValueError if missing).
+                    If False, symbols without a price are valued at 0 with unrealized P&L = -cost.
+
+        Returns:
+            PortfolioValuation with per-position and aggregate totals.
+        """
+        with self._lock:
+            pf = self._get_portfolio(portfolio_id)
+
+            # Convert prices to Decimal (cash precision)
+            dec_prices: Dict[str, Decimal] = {}
+            for sym, val in prices.items():
+                dec_prices[sym] = self._to_decimal(val, quant=self._cash_q)
+
+            positions_val: List[PositionValuation] = []
+            total_mv = Decimal(0)
+            total_unreal = Decimal(0)
+
+            for sym, pos in pf.holdings.items():
+                if sym not in dec_prices:
+                    if strict:
+                        raise ValueError(f"Missing price for symbol '{sym}'")
+                    px = Decimal(0).quantize(self._cash_q, rounding=self._rounding)
+                else:
+                    px = dec_prices[sym]
+
+                mv = (pos.quantity * px).quantize(self._cash_q, rounding=self._rounding)
+                avg = pos.avg_cost(quant=self._cash_q, rounding=self._rounding)
+                unreal = (pos.quantity * (px - avg)).quantize(self._cash_q, rounding=self._rounding)
+
+                positions_val.append(
+                    PositionValuation(
+                        symbol=sym,
+                        quantity=pos.quantity,
+                        price=px,
+                        market_value=mv,
+                        avg_cost=avg,
+                        unrealized_pnl=unreal,
+                    )
+                )
+                total_mv = (total_mv + mv).quantize(self._cash_q, rounding=self._rounding)
+                total_unreal = (total_unreal + unreal).quantize(self._cash_q, rounding=self._rounding)
+
+            report = PortfolioValuation(
+                portfolio_id=portfolio_id,
+                timestamp=datetime.now(timezone.utc),
+                total_market_value=total_mv,
+                total_unrealized_pnl=total_unreal,
+                realized_pnl_to_date=pf.realized_pnl,
+                positions=positions_val,
+            )
+            return report
+
+    # --------------------------- Internal Utils ---------------------------
+    def _to_decimal(self, value: Union[Decimal, int, float, str], *, quant: Decimal) -> Decimal:
+        """Convert a value to a quantized Decimal using provided precision and service rounding."""
+        try:
+            if isinstance(value, Decimal):
+                dec = value
+            elif isinstance(value, int):
+                dec = Decimal(value)
+            elif isinstance(value, float):
+                dec = Decimal(str(value))
+            elif isinstance(value, str):
+                dec = Decimal(value)
+            else:
+                raise InvalidTradeError(f"Unsupported numeric type: {type(value)!r}")
+            return dec.quantize(quant, rounding=self._rounding)
+        except (InvalidOperation, ValueError) as exc:
+            raise InvalidTradeError("Invalid numeric amount") from exc
+
+    def _get_portfolio(self, portfolio_id: str) -> Portfolio:
+        pf = self._portfolios.get(portfolio_id)
+        if pf is None:
+            raise PortfolioNotFoundError(f"Portfolio '{portfolio_id}' not found")
+        return pf
+
+    def _ensure_portfolio_exists(self, portfolio_id: str) -> None:
+        if portfolio_id not in self._portfolios:
+            raise PortfolioNotFoundError(f"Portfolio '{portfolio_id}' not found")
+
+    def _log_trade(self, record: TradeRecord) -> None:
+        self._trades.append(record)
+        self._per_portfolio_trades.setdefault(record.portfolio_id, []).append(record)
